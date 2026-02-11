@@ -1,0 +1,66 @@
+services:
+  redis:
+    container_name: redis
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+    networks:
+      - mcp-net
+
+  mcp-server-1:
+    container_name: mcp-server-1
+    build: .
+    environment:
+      - INSTANCE_ID=mcp-server-1
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - mcp-net
+
+  mcp-server-2:
+    container_name: mcp-server-2
+    build: .
+    environment:
+      - INSTANCE_ID=mcp-server-2
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - mcp-net
+
+  mcp-server-3:
+    container_name: mcp-server-3
+    build: .
+    environment:
+      - INSTANCE_ID=mcp-server-3
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - mcp-net
+
+  haproxy:
+    container_name: haproxy
+    image: haproxy:3.1
+    ports:
+      - "8080:8080"
+      - "8404:8404"
+    volumes:
+      - ./haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    depends_on:
+      - mcp-server-1
+      - mcp-server-2
+      - mcp-server-3
+    networks:
+      - mcp-net
+
+networks:
+  mcp-net:
+    driver: bridge
