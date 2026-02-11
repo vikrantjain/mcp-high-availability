@@ -1,30 +1,21 @@
-# Load Balancing Stateful MCP Servers
+# High Availability for Stateful MCP Servers
 
 MCP (Model Context Protocol) servers are inherently stateful -- each client-server session maintains state tied to a `mcp-session-id` header. This project demonstrates how to use **HAProxy's stick-table** feature to provide session-affine routing for MCP's Streamable HTTP transport, with **Redis-backed session state** for durability across server restarts and failovers.
 
 ## Architecture
 
-```
-                    ┌─────────────────┐
-                    │   MCP Clients   │
-                    └────────┬────────┘
-                             │
-                    ┌────────▼────────┐
-                    │    HAProxy      │  :8080 (proxy) / :8404 (stats)
-                    │  sticky sessions│
-                    │  + redispatch   │
-                    └──┬─────┬─────┬──┘
-                       │     │     │
-              ┌────────▼┐ ┌──▼──────┐ ┌▼────────┐
-              │mcp-server-1 │ │mcp-server-2 │ │mcp-server-3 │
-              │ :8000   │ │ :8000   │ │ :8000   │
-              └────┬────┘ └──┬───┘ └────┬─────┘
-                   │         │          │
-                   └────┬────┴────┬─────┘
-                   ┌────▼─────────▼────┐
-                   │    Redis 7        │
-                   │  session state    │
-                   └───────────────────┘
+```mermaid
+graph TD
+    A[MCP Clients] --> B[HAProxy<br/>:8080 proxy / :8404 stats<br/>sticky sessions + redispatch]
+    B --> C[mcp-server-1<br/>:8000]
+    B --> D[mcp-server-2<br/>:8000]
+    B --> E[mcp-server-3<br/>:8000]
+    C --> F[Redis 7<br/>session state]
+    D --> F
+    E --> F
+
+    style B fill:#e1f5ff
+    style F fill:#ffe1e1
 ```
 
 - **3 MCP server instances** running a stateful FastMCP server (session-scoped counters and notes)
@@ -36,60 +27,51 @@ MCP (Model Context Protocol) servers are inherently stateful -- each client-serv
 
 When a backend crashes or is stopped, the system recovers gracefully thanks to externalized state in Redis:
 
-```
-┌────────┐         ┌─────────┐       ┌──────────┐     ┌──────────┐     ┌───────┐
-│ Client │         │ HAProxy │       │ mcp-server-2 │     │ mcp-server-1 │     │ Redis │
-└───┬────┘         └────┬────┘       └────┬─────┘     └────┬─────┘     └───┬───┘
-    │                   │                  │                │               │
-    │ 1. Normal Operation: Session pinned to mcp-server-2 via stick-table      │
-    ├──increment_counter─>                 │                │               │
-    │  [session: abc123]│                  │                │               │
-    │                   ├─[stick lookup]──>│                │               │
-    │                   │   abc123→srv-2   │                │               │
-    │                   ├─────────────────>│                │               │
-    │                   │                  ├─INCR abc123───────────────────>│
-    │                   │                  │<──────5────────────────────────┤
-    │                   │<─────counter=5───┤                │               │
-    │<──────counter=5───┤                  │                │               │
-    │                   │                  │                │               │
-    │ 2. Backend Failure: mcp-server-2 crashes                                  │
-    │                   │                  X                │               │
-    │                   │  [health checks] │                │               │
-    │                   │  fail × 3        │                │               │
-    │                   │  → mark DOWN     │                │               │
-    │                   │                  │                │               │
-    │ 3. Client Re-initializes: Connection lost, start new session          │
-    ├──initialize───────>                  │                │               │
-    │  [no session ID]  │                  │                │               │
-    │                   ├─[leastconn]──────┼────────────────>               │
-    │                   │  pick healthy    │                │               │
-    │                   ├─────────────────────────────────>│               │
-    │                   │<─[session: xyz789]───────────────┤               │
-    │                   │  [store xyz789→srv-1]            │               │
-    │<──session: xyz789─┤                  │                │               │
-    │                   │                  │                │               │
-    │ 4. State Recovery: Copy old session state via resume_session          │
-    ├─resume_session────>                  │                │               │
-    │  [session: xyz789]│                  │                │               │
-    │  [old: abc123]    │                  │                │               │
-    │                   ├─────────────────────────────────>│               │
-    │                   │                  │                ├─SCAN abc123:*─>│
-    │                   │                  │                │<─[counter,..] ─┤
-    │                   │                  │                ├─COPY to xyz789─>│
-    │                   │                  │                │<─OK (2 keys)───┤
-    │                   │<─[keys_copied: 2]────────────────┤               │
-    │<──keys_copied: 2──┤                  │                │               │
-    │                   │                  │                │               │
-    │ 5. Resumed: Continue with recovered state                             │
-    ├─increment_counter─>                  │                │               │
-    │  [session: xyz789]│                  │                │               │
-    │                   ├─[stick lookup: xyz789→srv-1]     │               │
-    │                   ├─────────────────────────────────>│               │
-    │                   │                  │                ├─INCR xyz789───>│
-    │                   │                  │                │<──────6────────┤
-    │                   │<─────counter=6───────────────────┤               │
-    │<──────counter=6───┤                  │                │  (continues!)  │
-    │                   │                  │                │               │
+```mermaid
+sequenceDiagram
+    participant Client
+    participant HAProxy
+    participant Server2 as mcp-server-2
+    participant Server1 as mcp-server-1
+    participant Redis
+
+    Note over Client,Redis: 1. Normal Operation: Session pinned to mcp-server-2 via stick-table
+    Client->>HAProxy: increment_counter<br/>[session: abc123]
+    HAProxy->>Server2: [stick lookup: abc123→srv-2]
+    Server2->>Redis: INCR abc123
+    Redis-->>Server2: 5
+    Server2-->>HAProxy: counter=5
+    HAProxy-->>Client: counter=5
+
+    Note over Server2: 2. Backend Failure: mcp-server-2 crashes
+    Server2-xServer2: X (crashed)
+    Note over HAProxy,Server2: health checks fail × 3<br/>→ mark DOWN
+
+    Note over Client,Redis: 3. Client Re-initializes: Connection lost, start new session
+    Client->>HAProxy: initialize<br/>[no session ID]
+    Note over HAProxy: [leastconn] pick healthy
+    HAProxy->>Server1: initialize
+    Server1-->>HAProxy: [session: xyz789]
+    Note over HAProxy: [store xyz789→srv-1]
+    HAProxy-->>Client: session: xyz789
+
+    Note over Client,Redis: 4. State Recovery: Copy old session state via resume_session
+    Client->>HAProxy: resume_session<br/>[session: xyz789]<br/>[old: abc123]
+    HAProxy->>Server1: resume_session
+    Server1->>Redis: SCAN abc123:*
+    Redis-->>Server1: [counter,...]
+    Server1->>Redis: COPY to xyz789
+    Redis-->>Server1: OK (2 keys)
+    Server1-->>HAProxy: keys_copied: 2
+    HAProxy-->>Client: keys_copied: 2
+
+    Note over Client,Redis: 5. Resumed: Continue with recovered state
+    Client->>HAProxy: increment_counter<br/>[session: xyz789]
+    HAProxy->>Server1: [stick lookup: xyz789→srv-1]
+    Server1->>Redis: INCR xyz789
+    Redis-->>Server1: 6
+    Server1-->>HAProxy: counter=6
+    HAProxy-->>Client: counter=6 (continues!)
 ```
 
 **Key recovery steps:**
@@ -149,7 +131,7 @@ This builds 3 MCP server images and starts them along with HAProxy.
 docker compose ps
 ```
 
-You should see 5 containers: `redis`, `mcp-mcp-server-1`, `mcp-mcp-server-2`, `mcp-mcp-server-3`, and `haproxy`.
+You should see 5 containers: `redis`, `mcp-server-1`, `mcp-server-2`, `mcp-server-3`, and `haproxy`.
 
 ### 3. Check HAProxy Stats
 
@@ -263,11 +245,11 @@ HAProxy health: 200
 === Test: Backend Failure - State Recovery ===
   Session 1a2b3c4d5e6f... on: mcp-server-2
   State before crash: counter=3, notes=['survive-crash']
-  Stopping mcp-mcp-server-2...
+  Stopping mcp-server-2...
   New session 7a8b9c0d1e2f... on: mcp-server-1
   Resumed 2 keys from old session
   Counter continues: 4 (state fully recovered)
-  Restarting mcp-mcp-server-2...
+  Restarting mcp-server-2...
   PASSED
 
 ==================================================
@@ -291,7 +273,7 @@ All tests passed!
 OLD_SESSION_ID="$SESSION_ID"
 
 # 2. Stop that backend:
-docker compose stop mcp-mcp-server-2
+docker compose stop mcp-server-2
 
 # 3. Wait for HAProxy health check (fall 3 × inter 5s = ~15s)
 sleep 16
@@ -328,13 +310,13 @@ curl -s http://localhost:8080/mcp \
   -d '{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"get_counter","arguments":{}}}'
 
 # 7. Restart the backend
-docker compose start mcp-mcp-server-2
+docker compose start mcp-server-2
 ```
 
 ## Project Structure
 
 ```
-mcp-loadbalancing/
+mcp-high-availability/
 ├── server.py              # FastMCP server with Redis-backed session state
 ├── pyproject.toml         # Python project config (fastmcp, httpx, redis)
 ├── .python-version        # Python 3.12

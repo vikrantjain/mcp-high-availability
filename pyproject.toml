@@ -1,7 +1,7 @@
 [project]
-name = "mcp-loadbalancing"
+name = "mcp-high-availability"
 version = "0.1.0"
-description = "Load balancing stateful MCP servers with HAProxy sticky sessions"
+description = "High availability for stateful MCP servers with HAProxy sticky sessions and Redis-backed state"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
