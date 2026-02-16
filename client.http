@@ -1,3 +1,33 @@
+# Manual MCP session walkthrough — VS Code REST Client
+#
+# Requirements: VS Code with the REST Client extension
+#   https://marketplace.visualstudio.com/items?itemName=humao.rest-client
+#
+# How it works:
+#   The `@name session` annotation on Step 1 captures the full response,
+#   including headers. Every subsequent request reads the session ID from
+#   that captured response via {{session.response.headers.mcp-session-id}},
+#   so you never need to copy-paste it manually.
+#
+# What this walkthrough demonstrates:
+#   Step 1  Initialize → HAProxy assigns the session to a backend via leastconn
+#           and stores the mcp-session-id in its stick-table.
+#   Step 2  Send the required `notifications/initialized` acknowledgement.
+#   Step 3  List available tools.
+#   Step 4  get_server_info → note the `instance` field; all subsequent requests
+#           in this session will return the same instance (sticky routing).
+#   Steps 5–7  increment_counter twice, then get_counter — counter should reach 2
+#              and the instance should not change across calls.
+#   Steps 8–9  add_note and list_notes — demonstrates session-scoped note storage.
+#
+# To test failover manually:
+#   1. Note the instance from Step 4.
+#   2. Run: docker compose stop <instance-name>
+#   3. Wait ~15s for HAProxy health checks to mark it DOWN.
+#   4. Re-run Step 1 in a new session — HAProxy redispatches to a healthy backend.
+#   5. Call resume_session with old_session_id set to the session ID from Step 1
+#      to copy state from Redis into the new session.
+
 ### Step 1: Initialize MCP Connection (through HAProxy)
 # @name session
 POST http://localhost:8080/mcp

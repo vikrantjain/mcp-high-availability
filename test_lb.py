@@ -3,6 +3,7 @@
 import json
 import subprocess
 import sys
+import threading
 import time
 
 import httpx
@@ -25,6 +26,39 @@ def parse_sse_json(response: httpx.Response) -> dict | None:
     for line in response.text.strip().splitlines():
         if line.startswith("data: "):
             return json.loads(line[6:])
+    return None
+
+
+def parse_all_sse_events(response: httpx.Response) -> list[dict]:
+    """Parse ALL JSON-RPC messages from an SSE response body.
+
+    Returns every 'data:' line as a parsed dict — includes notifications
+    (progress, log messages) and the final result.
+    """
+    content_type = response.headers.get("content-type", "")
+    if "application/json" in content_type:
+        return [response.json()]
+
+    events = []
+    for line in response.text.strip().splitlines():
+        if line.startswith("data: "):
+            try:
+                events.append(json.loads(line[6:]))
+            except json.JSONDecodeError:
+                pass
+    return events
+
+
+def find_notifications(events: list[dict], method: str) -> list[dict]:
+    """Filter SSE events to only JSON-RPC notifications matching the given method."""
+    return [e for e in events if e.get("method") == method]
+
+
+def find_result(events: list[dict], req_id: int) -> dict | None:
+    """Find the JSON-RPC result event matching the given request id."""
+    for e in events:
+        if e.get("id") == req_id and "result" in e:
+            return e
     return None
 
 
@@ -228,6 +262,255 @@ def test_backend_failure():
     print("  PASSED\n")
 
 
+def test_health_endpoint():
+    """Test that GET /health returns 200 with status and instance info."""
+    print("=== Test: Health Endpoint ===")
+
+    resp = httpx.get("http://localhost:8080/health", timeout=10)
+    assert resp.status_code == 200, f"Health check failed: {resp.status_code} {resp.text}"
+
+    data = resp.json()
+    assert data["status"] == "ok", f"Expected status=ok, got {data['status']}"
+    assert "instance" in data, f"No instance in health response: {data}"
+    print(f"  Health OK from {data['instance']}")
+    print("  PASSED\n")
+
+
+def test_get_status():
+    """Test that get_status returns instance, uptime, active_sessions, timestamp."""
+    print("=== Test: get_status Tool ===")
+
+    with httpx.Client(timeout=30) as client:
+        initialize_session(client)
+        result = call_tool(client, "get_status", req_id=400)
+
+        assert "instance" in result, f"Missing 'instance': {result}"
+        assert "uptime_seconds" in result, f"Missing 'uptime_seconds': {result}"
+        assert isinstance(result["uptime_seconds"], (int, float)), f"uptime not numeric: {result}"
+        assert result["uptime_seconds"] > 0, f"uptime should be > 0: {result}"
+        assert "active_sessions" in result, f"Missing 'active_sessions': {result}"
+        assert isinstance(result["active_sessions"], int), f"active_sessions not int: {result}"
+        assert "timestamp" in result, f"Missing 'timestamp': {result}"
+
+        print(f"  Instance: {result['instance']}, uptime: {result['uptime_seconds']}s, "
+              f"sessions: {result['active_sessions']}")
+    print("  PASSED\n")
+
+
+def test_resume_session_same_id():
+    """Test that resume_session with the current session ID returns same_session."""
+    print("=== Test: resume_session Same ID ===")
+
+    with httpx.Client(timeout=30) as client:
+        session_id = initialize_session(client)
+
+        result = call_tool(client, "resume_session", {"old_session_id": session_id}, req_id=410)
+        assert result["status"] == "same_session", f"Expected same_session, got {result['status']}"
+        print(f"  Correctly returned same_session for own session ID")
+    print("  PASSED\n")
+
+
+def test_notes_crud():
+    """Test full add_note + list_notes cycle with multiple notes."""
+    print("=== Test: Notes CRUD ===")
+
+    with httpx.Client(timeout=30) as client:
+        initialize_session(client)
+
+        # Start with empty notes
+        result = call_tool(client, "list_notes", req_id=420)
+        assert result["notes"] == [], f"Expected empty notes, got {result['notes']}"
+
+        # Add multiple notes
+        notes_to_add = ["first note", "second note", "third note"]
+        for i, note in enumerate(notes_to_add):
+            result = call_tool(client, "add_note", {"note": note}, req_id=421 + i)
+            assert result["notes_count"] == i + 1, f"Expected count={i+1}, got {result['notes_count']}"
+
+        # List and verify ordering
+        result = call_tool(client, "list_notes", req_id=430)
+        assert result["notes"] == notes_to_add, f"Expected {notes_to_add}, got {result['notes']}"
+        print(f"  Notes after add: {result['notes']}")
+    print("  PASSED\n")
+
+
+def test_analyze_data_with_notifications():
+    """Test analyze_data emits progress and log notifications, returns correct result."""
+    print("=== Test: analyze_data with Notifications ===")
+
+    with httpx.Client(timeout=60) as client:
+        session_id = initialize_session(client)
+
+        req_id = 440
+        resp = mcp_request(
+            client,
+            "tools/call",
+            params={"name": "analyze_data", "arguments": {"num_items": 3}},
+            req_id=req_id,
+        )
+        assert resp.status_code == 200, f"analyze_data failed: {resp.status_code} {resp.text}"
+
+        events = parse_all_sse_events(resp)
+        assert len(events) > 1, f"Expected multiple SSE events (notifications + result), got {len(events)}"
+
+        # Check for log/message notifications (ctx.info / ctx.debug)
+        message_notifs = find_notifications(events, "notifications/message")
+        print(f"  Message notifications: {len(message_notifs)}")
+        assert len(message_notifs) > 0, "Expected at least one message notification"
+
+        # Verify some messages are info-level and some are debug-level
+        levels = {n["params"]["level"] for n in message_notifs}
+        print(f"  Log levels seen: {levels}")
+        assert "info" in levels, f"Expected info-level logs, got levels: {levels}"
+        assert "debug" in levels, f"Expected debug-level logs, got levels: {levels}"
+
+        # Verify message content (uses 'msg' key in data)
+        msgs = [n["params"]["data"]["msg"] for n in message_notifs]
+        assert any("Starting analysis" in m for m in msgs), f"Missing 'Starting analysis' log: {msgs}"
+        assert any("Analysis complete" in m for m in msgs), f"Missing 'Analysis complete' log: {msgs}"
+
+        # Check the final result
+        result_event = find_result(events, req_id)
+        assert result_event, f"No result event found for req_id={req_id}"
+        content = result_event["result"]["content"]
+        result = json.loads(content[0]["text"])
+
+        assert result["items_processed"] == 3, f"Expected 3 items, got {result['items_processed']}"
+        expected_score = 1 * 1.5 + 2 * 1.5 + 3 * 1.5  # 9.0
+        assert result["total_score"] == expected_score, f"Expected score={expected_score}, got {result['total_score']}"
+        print(f"  Result: items={result['items_processed']}, score={result['total_score']}")
+
+        # Verify result was stored in session via session_summary resource
+        res_resp = mcp_request(
+            client,
+            "resources/read",
+            params={"uri": f"resource://session/{session_id}/summary"},
+            req_id=441,
+        )
+        assert res_resp.status_code == 200, f"Resource read failed: {res_resp.status_code} {res_resp.text}"
+        res_data = parse_sse_json(res_resp)
+        assert res_data and "result" in res_data, f"No result in resource response: {res_data}"
+        resource_contents = res_data["result"]["contents"]
+        assert len(resource_contents) > 0, "Empty resource contents"
+        summary = json.loads(resource_contents[0]["text"])
+        assert summary["analysis_result"]["items_processed"] == 3, (
+            f"Session summary missing analysis: {summary}"
+        )
+        print(f"  Session summary confirms analysis stored")
+    print("  PASSED\n")
+
+
+def test_session_summary_resource():
+    """Test reading the session summary resource with counter and notes."""
+    print("=== Test: Session Summary Resource ===")
+
+    with httpx.Client(timeout=30) as client:
+        session_id = initialize_session(client)
+
+        # Set up some state
+        for i in range(1, 4):
+            call_tool(client, "increment_counter", req_id=450 + i)
+        call_tool(client, "add_note", {"note": "hello"}, req_id=460)
+        call_tool(client, "add_note", {"note": "world"}, req_id=461)
+
+        # Read the resource
+        resp = mcp_request(
+            client,
+            "resources/read",
+            params={"uri": f"resource://session/{session_id}/summary"},
+            req_id=470,
+        )
+        assert resp.status_code == 200, f"Resource read failed: {resp.status_code} {resp.text}"
+
+        data = parse_sse_json(resp)
+        assert data and "result" in data, f"No result in resource response: {data}"
+        contents = data["result"]["contents"]
+        assert len(contents) > 0, "Empty resource contents"
+
+        summary = json.loads(contents[0]["text"])
+        assert summary["session_id"] == session_id, f"Wrong session_id: {summary['session_id']}"
+        assert summary["counter"] == 3, f"Expected counter=3, got {summary['counter']}"
+        assert summary["notes"] == ["hello", "world"], f"Expected notes, got {summary['notes']}"
+        assert "instance" in summary, f"Missing instance: {summary}"
+
+        print(f"  Summary: counter={summary['counter']}, notes={summary['notes']}, "
+              f"instance={summary['instance']}")
+    print("  PASSED\n")
+
+
+def test_watch_counter_with_notifications():
+    """Test watch_counter detects changes and emits progress + log notifications."""
+    print("=== Test: watch_counter with Notifications ===")
+
+    with httpx.Client(timeout=60) as client:
+        session_id = initialize_session(client)
+
+        # Set initial counter
+        call_tool(client, "increment_counter", req_id=480)
+
+        # We'll use a separate thread to increment the counter while watch runs.
+        # Need a separate client with the same session header.
+        session_header = client.headers["mcp-session-id"]
+        increment_errors = []
+
+        def increment_in_background():
+            """Increment counter a few times with delays."""
+            time.sleep(1.5)  # Let the watcher start
+            try:
+                with httpx.Client(timeout=30) as inc_client:
+                    inc_client.headers["mcp-session-id"] = session_header
+                    inc_client.headers["Content-Type"] = "application/json"
+                    inc_client.headers["Accept"] = "application/json, text/event-stream"
+                    for i in range(3):
+                        time.sleep(0.8)
+                        call_tool(inc_client, "increment_counter", req_id=490 + i)
+            except Exception as e:
+                increment_errors.append(e)
+
+        # Start background incrementer
+        bg_thread = threading.Thread(target=increment_in_background, daemon=True)
+        bg_thread.start()
+
+        # Start the watcher (short duration)
+        req_id = 485
+        resp = mcp_request(
+            client,
+            "tools/call",
+            params={"name": "watch_counter", "arguments": {"duration_seconds": 5}},
+            req_id=req_id,
+        )
+        assert resp.status_code == 200, f"watch_counter failed: {resp.status_code} {resp.text}"
+
+        bg_thread.join(timeout=10)
+        assert not increment_errors, f"Background increment errors: {increment_errors}"
+
+        events = parse_all_sse_events(resp)
+        assert len(events) > 1, f"Expected multiple SSE events, got {len(events)}"
+
+        # Check log notifications
+        message_notifs = find_notifications(events, "notifications/message")
+        print(f"  Message notifications: {len(message_notifs)}")
+        assert len(message_notifs) > 0, "Expected message notifications from watch_counter"
+
+        # Check for change detection messages (uses 'msg' key in data)
+        change_messages = [
+            n for n in message_notifs
+            if "changed" in n.get("params", {}).get("data", {}).get("msg", "").lower()
+        ]
+        print(f"  Change detection messages: {len(change_messages)}")
+
+        # Check the final result
+        result_event = find_result(events, req_id)
+        assert result_event, f"No result event found for req_id={req_id}"
+        content = result_event["result"]["content"]
+        result = json.loads(content[0]["text"])
+
+        print(f"  Result: {result['total_changes']} change(s) detected")
+        assert result["total_changes"] > 0, f"Expected at least 1 change, got {result['total_changes']}"
+        assert len(result["changes"]) == result["total_changes"]
+    print("  PASSED\n")
+
+
 if __name__ == "__main__":
     print("MCP Load Balancing Tests")
     print("=" * 50)
@@ -245,6 +528,13 @@ if __name__ == "__main__":
     test_sticky_sessions()
     test_distribution()
     test_session_state_isolation()
+    test_health_endpoint()
+    test_get_status()
+    test_resume_session_same_id()
+    test_notes_crud()
+    test_analyze_data_with_notifications()
+    test_session_summary_resource()
+    test_watch_counter_with_notifications()
     test_backend_failure()
 
     print("=" * 50)

@@ -206,10 +206,6 @@ curl -s http://localhost:8080/mcp \
 
 If stickiness works, the counter increments sequentially and the `instance` field stays the same across calls.
 
-### Test with VS Code REST Client
-
-If you use VS Code with the [REST Client](https://marketplace.visualstudio.com/items?itemName=humao.rest-client) extension, open `client.http` and run the requests step by step. The file automatically captures the session ID from the `initialize` response and uses it in subsequent requests.
-
 ## Automated Tests
 
 Install dependencies and run the test suite:
@@ -229,27 +225,60 @@ Target: http://localhost:8080/mcp
 HAProxy health: 200
 
 === Test: Sticky Sessions ===
-  Session ID: bd2b4dff1dc541aa99572bba9dfc95c1
-  Routed to: mcp-server-1
-  Counter reached 10 on mcp-server-1 - stickiness confirmed!
+  Session ID: d528c59430d14bd1be7f711f910926ff
+  Routed to: mcp-server-3
+  Counter reached 10 on mcp-server-3 - stickiness confirmed!
   PASSED
 
 === Test: Distribution Across Backends ===
-  Sessions distributed across: {'mcp-server-2', 'mcp-server-3', 'mcp-server-1'}
+  Sessions distributed across: {'mcp-server-2', 'mcp-server-1', 'mcp-server-3'}
   PASSED
 
 === Test: Session State Isolation ===
   Session state is properly isolated
   PASSED
 
+=== Test: Health Endpoint ===
+  Health OK from mcp-server-2
+  PASSED
+
+=== Test: get_status Tool ===
+  Instance: mcp-server-1, uptime: 60.4s, sessions: 7
+  PASSED
+
+=== Test: resume_session Same ID ===
+  Correctly returned same_session for own session ID
+  PASSED
+
+=== Test: Notes CRUD ===
+  Notes after add: ['first note', 'second note', 'third note']
+  PASSED
+
+=== Test: analyze_data with Notifications ===
+  Message notifications: 7
+  Log levels seen: {'info', 'debug'}
+  Result: items=3, score=9.0
+  Session summary confirms analysis stored
+  PASSED
+
+=== Test: Session Summary Resource ===
+  Summary: counter=3, notes=['hello', 'world'], instance=mcp-server-3
+  PASSED
+
+=== Test: watch_counter with Notifications ===
+  Message notifications: 5
+  Change detection messages: 3
+  Result: 3 change(s) detected
+  PASSED
+
 === Test: Backend Failure - State Recovery ===
-  Session 1a2b3c4d5e6f... on: mcp-server-2
+  Session 381eb66a18a4... on: mcp-server-1
   State before crash: counter=3, notes=['survive-crash']
-  Stopping mcp-server-2...
-  New session 7a8b9c0d1e2f... on: mcp-server-1
+  Stopping mcp-server-1...
+  New session db123608fb3b... on: mcp-server-3
   Resumed 2 keys from old session
   Counter continues: 4 (state fully recovered)
-  Restarting mcp-server-2...
+  Restarting mcp-server-1...
   PASSED
 
 ==================================================
@@ -260,10 +289,17 @@ All tests passed!
 
 | Test | What it proves |
 |------|----------------|
-| **Sticky Sessions** | Counter increments 1-10 on the same backend. Session ID routes to the same server every time. |
-| **Distribution** | 10 independent sessions are spread across at least 2 of the 3 backends (leastconn ensures even distribution based on active connections). |
+| **Sticky Sessions** | Counter increments 1–10 on the same backend. Session ID always routes to the same server. |
+| **Distribution** | 10 independent sessions spread across at least 2 of 3 backends (leastconn distributes by active connections). |
 | **Session State Isolation** | Two concurrent sessions have independent counters and notes. |
-| **Backend Failure - State Recovery** | When a sticky backend is stopped, HAProxy redispatches to a healthy backend. The client re-initializes a new session and calls `resume_session` with the old session ID to recover state from Redis. Counter continues from where it left off. |
+| **Health Endpoint** | `GET /health` returns 200 with `status: ok` and instance ID; also checks Redis connectivity. |
+| **get_status** | Tool returns instance, uptime, active session count, and timestamp. |
+| **resume_session Same ID** | Calling `resume_session` with the current session's own ID returns `{"status": "same_session"}`. |
+| **Notes CRUD** | Full add/list cycle with multiple notes; verifies insertion order. |
+| **analyze_data with Notifications** | SSE stream contains info- and debug-level log notifications alongside the final result; result is stored in session and readable via the resource endpoint. |
+| **Session Summary Resource** | `resources/read` on `resource://session/{id}/summary` returns correct counter, notes, and instance. |
+| **watch_counter with Notifications** | Concurrent counter increments (background thread) are detected by the watcher; change notifications appear in the SSE stream. |
+| **Backend Failure - State Recovery** | When a sticky backend is stopped, HAProxy redispatches; `resume_session` copies Redis keys to the new session and the counter continues from where it left off. |
 
 ## Testing Backend Failure and Recovery Manually
 
@@ -317,15 +353,19 @@ docker compose start mcp-server-2
 
 ```
 mcp-high-availability/
-├── server.py              # FastMCP server with Redis-backed session state
+├── server.py              # FastMCP server — tools, resources, health endpoint
+├── session_store.py       # SessionStore ABC + Session helper (JSON serde, TTL)
+├── stores/
+│   ├── redis_store.py     # Redis-backed store (only file that imports redis.asyncio)
+│   └── memory_store.py    # Dict-backed store with lazy TTL expiry (local dev)
 ├── pyproject.toml         # Python project config (fastmcp, httpx, redis)
 ├── .python-version        # Python 3.12
 ├── Dockerfile             # Server container image
 ├── docker-compose.yaml    # Redis + 3 MCP servers + HAProxy
 ├── haproxy/
 │   └── haproxy.cfg        # HAProxy config with sticky sessions + redispatch
-├── client.http            # Manual testing via VS Code REST Client
-├── test_lb.py             # Automated test suite
+├── client.http            # Step-by-step manual testing via VS Code REST Client
+├── test_lb.py             # Automated integration test suite
 └── README.md
 ```
 
@@ -340,7 +380,12 @@ The server (`server.py`) exposes these tools, all returning the `instance` field
 | `add_note` | Add a note to the session's note list |
 | `list_notes` | List all notes for the session |
 | `get_server_info` | Return instance ID and active session count |
+| `get_status` | Return instance ID, uptime, active session count, and current timestamp |
+| `analyze_data` | Multi-step analysis pipeline; streams progress and log notifications via SSE |
+| `watch_counter` | Poll the session counter for changes and stream log notifications on each change |
 | `resume_session` | Copy state from a previous session into the current one (for recovery after crash/restart) |
+
+The server also exposes a `resource://session/{session_id}/summary` resource that returns a JSON snapshot of the session's counter, notes, and last analysis result.
 
 ## Design Decisions
 

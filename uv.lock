@@ -732,7 +732,7 @@ wheels = [
 ]
 
 [[package]]
-name = "mcp-loadbalancing"
+name = "mcp-high-availability"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [

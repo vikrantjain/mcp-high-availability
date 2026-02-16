@@ -7,7 +7,8 @@ RUN pip install uv
 COPY pyproject.toml .python-version ./
 RUN uv sync --no-dev
 
-COPY server.py .
+COPY server.py session_store.py ./
+COPY stores/ stores/
 
 EXPOSE 8000
 
