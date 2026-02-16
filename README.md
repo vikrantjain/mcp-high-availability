@@ -38,8 +38,9 @@ sequenceDiagram
     Note over Client,Redis: 1. Normal Operation: Session pinned to mcp-server-2 via stick-table
     Client->>HAProxy: increment_counter<br/>[session: abc123]
     HAProxy->>Server2: [stick lookup: abc123→srv-2]
-    Server2->>Redis: INCR abc123
-    Redis-->>Server2: 5
+    Server2->>Redis: GET mcp:session:abc123:counter
+    Redis-->>Server2: "4"
+    Server2->>Redis: SET mcp:session:abc123:counter "5"
     Server2-->>HAProxy: counter=5
     HAProxy-->>Client: counter=5
 
@@ -58,18 +59,19 @@ sequenceDiagram
     Note over Client,Redis: 4. State Recovery: Copy old session state via resume_session
     Client->>HAProxy: resume_session<br/>[session: xyz789]<br/>[old: abc123]
     HAProxy->>Server1: resume_session
-    Server1->>Redis: SCAN abc123:*
-    Redis-->>Server1: [counter,...]
-    Server1->>Redis: COPY to xyz789
-    Redis-->>Server1: OK (2 keys)
+    Server1->>Redis: SCAN mcp:session:abc123:*
+    Redis-->>Server1: [counter, notes]
+    Server1->>Redis: GET+SET each key → mcp:session:xyz789:*
+    Redis-->>Server1: OK (2 keys copied)
     Server1-->>HAProxy: keys_copied: 2
     HAProxy-->>Client: keys_copied: 2
 
     Note over Client,Redis: 5. Resumed: Continue with recovered state
     Client->>HAProxy: increment_counter<br/>[session: xyz789]
     HAProxy->>Server1: [stick lookup: xyz789→srv-1]
-    Server1->>Redis: INCR xyz789
-    Redis-->>Server1: 6
+    Server1->>Redis: GET mcp:session:xyz789:counter
+    Redis-->>Server1: "5"
+    Server1->>Redis: SET mcp:session:xyz789:counter "6"
     Server1-->>HAProxy: counter=6
     HAProxy-->>Client: counter=6 (continues!)
 ```
@@ -208,7 +210,11 @@ If stickiness works, the counter increments sequentially and the `instance` fiel
 
 ## Automated Tests
 
-Install dependencies and run the test suite:
+Three complementary test suites are provided:
+
+### 1. Infrastructure Tests (HTTP-based)
+
+Tests HAProxy load balancing, sticky sessions, and failover using raw HTTP calls:
 
 ```bash
 uv sync
@@ -301,6 +307,72 @@ All tests passed!
 | **watch_counter with Notifications** | Concurrent counter increments (background thread) are detected by the watcher; change notifications appear in the SSE stream. |
 | **Backend Failure - State Recovery** | When a sticky backend is stopped, HAProxy redispatches; `resume_session` copies Redis keys to the new session and the counter continues from where it left off. |
 
+### 2. MCP Protocol Tests (FastMCP Client)
+
+Tests MCP tools, notifications, and resources using the FastMCP client library:
+
+```bash
+uv run python test_mcp_client.py
+```
+
+These tests focus on:
+- Tool responses and return values
+- Notification streaming (progress, logs)
+- Resource reading
+- Session resumption logic
+- Concurrent operations
+
+**Key difference:** The FastMCP client tests verify MCP protocol functionality without testing infrastructure concerns (load balancing, sticky sessions, failover). They complement the HTTP-based tests by ensuring the MCP server implementation is correct.
+
+### 3. Resilience Tests (Resilient Client)
+
+Tests automatic session resumption with actual container restarts:
+
+```bash
+uv run python test_resilience.py
+```
+
+This test:
+- Builds up session state (counter, notes)
+- Restarts all MCP server containers
+- Automatically reconnects and resumes the session
+- Verifies state persisted in Redis is recovered
+- Continues operations seamlessly
+
+**Implementation:** Uses `ResilientClient` (`resilient_client.py`), a wrapper around FastMCP Client that automatically:
+- Detects connection failures
+- Retries with backoff
+- Calls `resume_session` to restore state from Redis
+- Transparently resumes operations
+
+## Resilient Client
+
+The server-side infrastructure (HAProxy + Redis) handles routing and state persistence, but **the client must also participate in recovery**. When a backend crashes, the MCP protocol session is lost — the client gets a connection error, not a transparent failover. Without client-side logic, the caller would need to manually re-initialize, call `resume_session`, and retry the failed operation.
+
+`resilient_client.py` provides `ResilientClient`, a drop-in wrapper around FastMCP's `Client` that closes this gap:
+
+```python
+from resilient_client import ResilientClient
+
+async with ResilientClient("http://localhost:8080/mcp") as client:
+    result = await client.call_tool("increment_counter", {})
+    notes = await client.list_resources()
+    # All async methods automatically retry on failure with session resumption
+```
+
+**How it works:**
+1. All async methods from the inner FastMCP `Client` (e.g. `call_tool`, `list_resources`, `read_resource`) are wrapped with retry logic via `__getattr__`
+2. On failure: waits with backoff, reconnects to get a new session, calls `resume_session` to copy state from the old session in Redis
+3. Retries the original call on the new connection — the caller never sees the interruption
+
+**Without `ResilientClient`**, a backend failure requires the caller to:
+1. Catch the connection error
+2. Create a new `Client` and re-initialize
+3. Call `resume_session(old_session_id)` to recover state
+4. Retry the failed operation
+
+This is the pattern that `test_lb.py` uses (raw HTTP with manual recovery), while `test_mcp_client.py` and `test_resilience.py` use `ResilientClient` for automatic recovery.
+
 ## Testing Backend Failure and Recovery Manually
 
 ```bash
@@ -365,7 +437,10 @@ mcp-high-availability/
 ├── haproxy/
 │   └── haproxy.cfg        # HAProxy config with sticky sessions + redispatch
 ├── client.http            # Step-by-step manual testing via VS Code REST Client
-├── test_lb.py             # Automated integration test suite
+├── test_lb.py             # HTTP-based infrastructure tests (HAProxy, load balancing)
+├── test_mcp_client.py     # Protocol tests using resilient client
+├── test_resilience.py     # Resilience test with container restarts
+├── resilient_client.py    # FastMCP Client wrapper with retry + session resumption
 └── README.md
 ```
 
@@ -405,7 +480,7 @@ The stick-table lookup (~50-100ns) is negligible compared to Redis I/O (~200-100
 ### Key Findings
 
 - **`stick store-response res.hdr()` works with SSE responses.** HAProxy processes HTTP response headers before the body streams, so it captures the `mcp-session-id` header even though the body is `text/event-stream`.
-- **Redis externalizes session state.** Counters use `INCR` (atomic, no read-modify-write races) and notes use `RPUSH`/`LRANGE` (native list operations). All keys have a 30-minute sliding TTL matching the HAProxy stick-table expiry.
+- **Redis externalizes session state.** All values are JSON-serialized strings stored via `SET`/`GET`. Counters are incremented in Python (read-modify-write in `server.py`), notes are stored as JSON arrays. All keys have a 30-minute sliding TTL matching the HAProxy stick-table expiry.
 - **`option redispatch` enables failover.** When a sticky backend goes down, HAProxy reroutes to a healthy backend instead of returning 503. Since state is in Redis, any backend can serve any session.
 - **MCP session IDs are ephemeral.** When a backend crashes, the MCP protocol session is lost and the client must re-initialize (getting a new `mcp-session-id`). The `resume_session` tool bridges old and new sessions by copying Redis keys.
 - **`ctx.session_id` from FastMCP** (context.py) provides the `mcp-session-id` header value -- perfect for keying state in Redis.
