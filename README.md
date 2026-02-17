@@ -373,6 +373,76 @@ async with ResilientClient("http://localhost:8080/mcp") as client:
 
 This is the pattern that `test_lb.py` uses (raw HTTP with manual recovery), while `test_mcp_client.py` and `test_resilience.py` use `ResilientClient` for automatic recovery.
 
+## Applying This to Your Own MCP Server
+
+This reference implementation is designed to be picked apart. Below are the six patterns you need to adopt, why each matters, and exactly where to find the code.
+
+### 1. Externalize Session State to a Shared Store
+
+**Why:** In-process state dies with the server. Externalizing to Redis (or any networked store) lets any instance serve any session after failover — without it, a crash means total state loss.
+
+**What to adopt:**
+
+- **`SessionStore` ABC** (`session_store.py:8-30`) — defines the storage contract: `get`, `set`, `delete`, `keys`, `copy_session`, `ping`. Implement this interface for your own backing store.
+- **`Session` wrapper** (`session_store.py:33-55`) — binds a store + session ID + TTL with automatic JSON serde. Tool authors only call `session.get(key)` / `session.set(key, value)` — no direct store imports needed.
+- **`RedisSessionStore`** (`stores/redis_store.py`) — the only file that imports `redis.asyncio`. Keys follow the `mcp:session:{session_id}:{key}` pattern with sliding TTL.
+- **`InMemorySessionStore`** (`stores/memory_store.py`) — dict-backed fallback with lazy TTL expiry, for local dev without Redis.
+- **Store selection** (`server.py:21`) — `RedisSessionStore(url) if REDIS_URL else InMemorySessionStore()`. One env var switches between production and local dev.
+
+### 2. Add a Health Check Endpoint
+
+**Why:** The load balancer needs to detect when a backend is down so it can stop routing traffic to it and trigger redispatch. Without health checks, clients hit dead backends until TCP timeouts expire.
+
+**What to adopt:**
+
+- **`/health` endpoint** (`server.py:209-218`) — calls `store.ping()` to verify Redis connectivity. Returns `200` with `{"status": "ok"}` when healthy, `503` with `{"status": "degraded"}` when the store is unreachable.
+- HAProxy polls this every 5s (`haproxy/haproxy.cfg:42-43`): `option httpchk GET /health` with `inter 5s fall 3 rise 2` on each server line.
+
+### 3. Include Instance Identity in Tool Responses
+
+**Why:** When debugging routing issues across multiple instances, you need to know which server handled each request. Without this, session-affinity bugs are invisible.
+
+**What to adopt:**
+
+- **`INSTANCE_ID`** (`server.py:16`) — `os.environ.get("INSTANCE_ID", "unknown")`
+- Every tool response includes `"instance": INSTANCE_ID` (e.g., `server.py:39`, `server.py:47`, `server.py:61`). This is a debugging aid — strip it in production if you prefer.
+
+### 4. Implement a Session Recovery Tool
+
+**Why:** MCP session IDs are ephemeral — when a backend crashes, the protocol session is lost and the client gets a new session ID on reconnect. Without a recovery mechanism, all prior state is orphaned in the store under the old session's keys.
+
+**What to adopt:**
+
+- **`resume_session` tool** (`server.py:80-95`) — accepts the old session ID and copies all store keys to the new session via `session.copy_from(old_session_id)`.
+- **`Session.copy_from()`** (`session_store.py:54-55`) — delegates to `store.copy_session()`.
+- **`RedisSessionStore.copy_session()`** (`stores/redis_store.py:39-62`) — uses `SCAN` to find all old keys and re-`SET` them under the new session prefix with fresh TTL.
+
+### 5. Configure Your Load Balancer for MCP's Streamable HTTP
+
+**Why:** MCP uses SSE for streaming responses and `mcp-session-id` headers for session affinity. Default load balancer settings (short timeouts, no session stickiness) will break both.
+
+**What to adopt from `haproxy/haproxy.cfg`:**
+
+- **Sticky sessions** (lines 32, 36, 40): `stick-table` keyed on `mcp-session-id` + `stick store-response res.hdr(mcp-session-id)` to learn the session ID from the first response + `stick match req.hdr(mcp-session-id)` to route subsequent requests.
+- **SSE-compatible timeouts** (lines 14-16): `timeout client/server 300s`, `timeout tunnel 600s`. Default timeouts (~30s) will kill long-running tool calls mid-stream.
+- **Failover** (line 10): `option redispatch` — reroute to a healthy backend instead of returning 503 when the sticky backend is down.
+- **Health checks** (lines 42-43, 45-47): `option httpchk GET /health` with `inter 5s fall 3 rise 2` — backends marked DOWN after 3 consecutive failures.
+- **TTL alignment**: `stick-table expire 30m` must match `SESSION_TTL = 1800` in `server.py:18`, otherwise the stick-table and session state can expire out of sync.
+
+If you use a different load balancer (Nginx, Envoy, AWS ALB), the concepts are the same: sticky sessions on a custom header, extended timeouts for SSE, health checks, and failover routing.
+
+### 6. Use a Resilient Client
+
+**Why:** Server-side infrastructure handles routing and state persistence, but the MCP client must participate in recovery — it needs to detect connection loss, reconnect, call `resume_session`, and retry the failed operation.
+
+**What to adopt:**
+
+- **`ResilientClient`** (`resilient_client.py:10-70`) — wraps FastMCP's `Client` with `__getattr__` that intercepts all async method calls.
+- **On failure**: exponential backoff (`resilient_client.py:65`), reconnect + `resume_session` (`resilient_client.py:36-50`), then retry the original call.
+- **Usage**: `async with ResilientClient("http://localhost:8080/mcp") as client:` — drop-in replacement for `Client`.
+
+Without client-side resilience, every backend failure requires the caller to manually catch the error, re-initialize, call `resume_session`, and retry. See the "Resilient Client" section above for the full breakdown.
+
 ## Testing Backend Failure and Recovery Manually
 
 ```bash
